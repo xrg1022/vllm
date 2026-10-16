@@ -1,0 +1,262 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""RadixShmem connector with its own scheduler, worker and transfer protocol."""
+
+from collections.abc import Iterable
+from functools import cached_property
+from typing import Any
+
+import torch
+
+from vllm.config import VllmConfig
+from vllm.distributed.kv_events import KVCacheEvent
+from vllm.distributed.kv_transfer.kv_connector.v1 import (
+    KVConnectorBase_V1,
+    KVConnectorRole,
+    SupportsHMA,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    KVConnectorTransferResults,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+    OffloadPromMetrics,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.radixshmem.config import (
+    build_radix_offloading_config,
+    get_offloading_group_ids,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.radixshmem.metadata import (
+    RadixShmemMetadata,
+    RadixShmemWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.radixshmem.scheduler import (
+    RadixShmemConnectorScheduler,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.radixshmem.worker import (
+    RadixShmemConnectorWorker,
+)
+from vllm.forward_context import ForwardContext
+from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_offload.radixshmem.backend import RadixShmemBackend
+from vllm.v1.metrics.cache_hit_source import CacheHitSource
+from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import Request
+
+
+class RadixShmemConnector(KVConnectorBase_V1, SupportsHMA):
+    @cached_property
+    def _bounding_group_ids(self) -> tuple[int, ...]:
+        offloaded = set(get_offloading_group_ids(self._kv_cache_config))
+        return tuple(
+            group_id
+            for group_id, group in enumerate(self._kv_cache_config.kv_cache_groups)
+            if group.kv_cache_spec.prefix_cacheable and group_id not in offloaded
+        )
+
+    @property
+    def scheduler(self) -> RadixShmemConnectorScheduler:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler
+
+    @property
+    def requires_kv_delivery(self) -> bool:
+        return False
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: KVCacheConfig,
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
+
+        assert vllm_config.kv_transfer_config is not None
+        offloading_config = build_radix_offloading_config(vllm_config, kv_cache_config)
+        spec = RadixShmemBackend(offloading_config)
+
+        self.connector_scheduler: RadixShmemConnectorScheduler | None = None
+        self.connector_worker: RadixShmemConnectorWorker | None = None
+        if role == KVConnectorRole.SCHEDULER:
+            self.connector_scheduler = RadixShmemConnectorScheduler(
+                spec, vllm_config, kv_cache_config
+            )
+        elif role == KVConnectorRole.WORKER:
+            self.connector_worker = RadixShmemConnectorWorker(
+                spec, vllm_config, kv_cache_config
+            )
+
+    def shutdown(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.shutdown()
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.shutdown()
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        assert self.connector_worker is not None
+        self.connector_worker.register_kv_caches(kv_caches)
+
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
+        assert self.connector_worker is not None
+        assert isinstance(kv_connector_metadata, RadixShmemMetadata)
+        self.connector_worker.handle_preemptions(kv_connector_metadata)
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        assert self.connector_worker is not None
+        assert isinstance(self._connector_metadata, RadixShmemMetadata)
+        self.connector_worker.start_kv_transfers(self._connector_metadata)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        pass
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        pass
+
+    def wait_for_save(self):
+        assert self.connector_worker is not None
+        assert isinstance(self._connector_metadata, RadixShmemMetadata)
+        self.connector_worker.prepare_store_kv(self._connector_metadata)
+
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+        assert self.connector_worker is not None
+        assert isinstance(self._connector_metadata, RadixShmemMetadata)
+        return self.connector_worker.get_finished(finished_req_ids)
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_transfer_results(finished_req_ids)
+
+    def build_connector_worker_meta(self) -> RadixShmemWorkerMetadata | None:
+        if self.connector_worker is not None:
+            return self.connector_worker.build_connector_worker_meta()
+        return None
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        self.scheduler.bind_gpu_block_pool(gpu_block_pool)
+
+    def on_new_request(self, request: "Request") -> None:
+        self.scheduler.on_new_request(request)
+
+    def get_num_new_matched_tokens(
+        self, request: "Request", num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
+        return self.scheduler.get_num_new_matched_tokens(
+            request,
+            num_computed_tokens,
+            max_num_new_tokens=self._max_loadable_tokens(request, num_computed_tokens),
+        )
+
+    def _max_loadable_tokens(
+        self, request: "Request", num_computed_tokens: int
+    ) -> int | None:
+        if not self._bounding_group_ids:
+            return None
+        assert self._kv_cache_manager is not None
+        coordinator = self._kv_cache_manager.coordinator
+        assert isinstance(coordinator, HybridKVCacheCoordinator)
+        _, per_group_hits = coordinator.find_longest_cache_hit_per_group(
+            request.block_hashes, request.num_tokens - 1
+        )
+        bound = min(per_group_hits[group_id] for group_id in self._bounding_group_ids)
+        return max(0, bound - num_computed_tokens)
+
+    def get_external_cache_hit_sources(
+        self,
+        request: "Request",
+        num_external_tokens: int,
+    ) -> dict[CacheHitSource, int]:
+        return self.scheduler.get_external_cache_hit_sources(
+            request, num_external_tokens
+        )
+
+    def update_state_after_alloc(
+        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+    ):
+        return self.scheduler.update_state_after_alloc(
+            request, blocks, num_external_tokens
+        )
+
+    def build_connector_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> KVConnectorMetadata:
+        return self.scheduler.build_connector_meta(scheduler_output)
+
+    def has_pending_push_work(self) -> bool:
+        return self.scheduler.has_pending_push_work()
+
+    def reset_cache(self) -> bool | None:
+        return self.scheduler.reset_cache()
+
+    def update_connector_output(self, connector_output: KVConnectorOutput):
+        self.scheduler.update_connector_output(connector_output)
+
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return self.scheduler.request_finished(request, (block_ids,))
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return self.scheduler.request_finished(request, block_ids)
+
+    def take_events(self) -> Iterable[KVCacheEvent]:
+        return self.scheduler.take_events()
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
+        if vllm_config.attention_config.hisparse_config is not None:
+            return "BLHNC"
+        return "LBHNC"
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        # Transfers are counted on the workers.
+        if self.connector_worker is not None:
+            return self.connector_worker.get_kv_connector_stats()
+        return None
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> KVConnectorStats | None:
+        return (
+            OffloadingConnectorStats(data=data)
+            if data is not None
+            else OffloadingConnectorStats()
+        )
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return OffloadPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
