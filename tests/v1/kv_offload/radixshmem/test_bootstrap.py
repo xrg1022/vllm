@@ -7,11 +7,29 @@ layout sentinel ``/dev/shm/<name>.vllm.json``.
 
 import json
 import os
+from contextlib import closing
+from dataclasses import replace
 
 import pytest
+import torch
 
+from tests.v1.kv_connector.unit.offloading_connector.test_config import (
+    _make_kv_cache_config,
+    _make_vllm_config,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.radixshmem.config import (
+    build_radix_offloading_config,
+)
 from vllm.utils.hashing import sha256
-from vllm.v1.core.kv_cache_utils import init_none_hash
+from vllm.v1.core.kv_cache_utils import (
+    generate_scheduler_kv_cache_config,
+    init_none_hash,
+)
+from vllm.v1.kv_cache_interface import (
+    UniformTypeKVCacheSpecs,
+)
+from vllm.v1.kv_offload.radixshmem.backend import RadixShmemBackend
+from vllm.v1.kv_offload.radixshmem.bootstrap import RadixRegions
 from vllm.v1.kv_offload.radixshmem.manager import Chunk
 
 from .utils import (
@@ -22,6 +40,7 @@ from .utils import (
     cleanup_shm,
     default_cpu_bytes,
     hit_len,
+    make_config,
     make_extra,
     open_manager,
     open_pool,
@@ -41,7 +60,7 @@ from .utils import (
 radixshmem = pytest.importorskip("radixshmem")
 
 
-def test_remote_replica_bootstraps_its_pool_and_namespace_separates_caches(
+def test_remote_replica_bootstraps_its_pool_and_separates_cache_domains(
     name, external_server
 ):
     # In remote mode a replica with a nonzero DP rank owns its node's pool.
@@ -60,6 +79,13 @@ def test_remote_replica_bootstraps_its_pool_and_namespace_separates_caches(
         with open_manager({**extra, "cache_namespace": "weights-v2"}) as other:
             assert other.index.lookup(to_u64(keys)) == 0
         first.finish_request("writer")
+    groups = (
+        replace(
+            make_config(extra).groups[0], cache_format=("torch.bfloat16", "NONE", "")
+        ),
+    )
+    with open_pool(extra, groups=groups), open_manager(extra, groups=groups) as other:
+        assert other.index.lookup(to_u64(keys)) == 0
 
 
 SENTINEL_KEYS = {
@@ -75,6 +101,7 @@ SENTINEL_KEYS = {
     "num_slots",
     "kv_cache_layout",
     "model",
+    "cache_formats",
 }
 
 
@@ -100,6 +127,44 @@ def _extra(name: str, **overrides) -> dict:
 def _read_sentinel(name: str) -> dict:
     with open(sentinel_path(name)) as f:
         return json.load(f)
+
+
+def test_attach_checks_resolved_cache_format(name):
+    config = _make_vllm_config(extra_config=_extra(name))
+    config.cache_config.cache_dtype = "auto"
+    config.cache_config.kv_cache_layout = None
+    config.model_config.dtype = torch.float16
+    worker_config = _make_kv_cache_config()
+    spec = replace(worker_config.kv_cache_groups[0].kv_cache_spec, dtype=torch.float16)
+    worker_config.kv_cache_groups[0].kv_cache_spec = UniformTypeKVCacheSpecs(
+        spec.block_size, {"layer": spec}
+    )
+    owner = RadixShmemBackend(build_radix_offloading_config(config, worker_config))
+    # Worker-side config strings may resolve after the specs have been collected.
+    config.cache_config.cache_dtype = "fp8"
+    scheduler = RadixShmemBackend(
+        build_radix_offloading_config(
+            config, generate_scheduler_kv_cache_config([worker_config])
+        )
+    )
+    assert owner.fingerprint() == scheduler.fingerprint()
+    with closing(
+        RadixRegions.open_worker(
+            owner.geometry, owner.settings, owner.fingerprint(), owner=True
+        )
+    ):
+        scheduler.open_manager().shutdown()
+        worker_config.kv_cache_groups[0].kv_cache_spec = replace(
+            spec, dtype=torch.bfloat16
+        )
+        other = RadixShmemBackend(build_radix_offloading_config(config, worker_config))
+        assert other.geometry == owner.geometry
+        with pytest.raises(RuntimeError, match="cache_formats"):
+            other.open_manager()
+        with pytest.raises(RuntimeError, match="cache_formats"):
+            RadixRegions.open_worker(
+                other.geometry, other.settings, other.fingerprint(), owner=False
+            )
 
 
 def test_owner_worker_creates_the_pool_and_a_scheduler_attaches(name):

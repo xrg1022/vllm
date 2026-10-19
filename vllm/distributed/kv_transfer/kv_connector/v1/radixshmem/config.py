@@ -14,8 +14,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
 )
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
@@ -44,6 +46,19 @@ def _kv_bytes_per_block(group: KVCacheGroupSpec) -> int:
     if isinstance(spec, UniformTypeKVCacheSpecs):
         return spec.page_size_bytes
     return spec.page_size_bytes * len(group.layer_names)
+
+
+def _cache_format(group: KVCacheGroupSpec) -> tuple[str, ...]:
+    # Match the representative spec used when scheduler groups are flattened.
+    spec = next(iter(iter_layer_specs(group.kv_cache_spec)))
+    if isinstance(spec, MambaSpec):
+        return tuple(str(dtype) for dtype in spec.dtypes)
+    assert isinstance(spec, AttentionSpec)
+    return (
+        str(spec.dtype),
+        spec.kv_quant_mode.name,
+        getattr(spec, "cache_dtype_str", None) or "",
+    )
 
 
 def _check_supported(vllm_config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
@@ -87,6 +102,7 @@ def build_radix_offloading_config(
             RadixGroupConfig(
                 **{f.name: getattr(g, f.name) for f in fields(g)},
                 kv_cache_spec_kind=get_kv_cache_spec_kind(kv_group.kv_cache_spec).value,
+                cache_format=_cache_format(kv_group),
                 kv_bytes_per_block=_kv_bytes_per_block(kv_group),
                 sliding_window=sliding_window,
                 extra_retained_tokens=extra_retained,

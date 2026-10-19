@@ -131,6 +131,7 @@ def make_config(
                 layer_names=("layer",),
                 group_id=0,
                 kv_cache_spec_kind="full_attention",
+                cache_format=("torch.float16", "NONE", ""),
             ),
         )
     return OffloadingConfig(
@@ -209,6 +210,7 @@ def two_groups(
         layer_names=("full_layer",),
         group_id=FULL_GROUP_ID,
         kv_cache_spec_kind="full_attention",
+        cache_format=("torch.float16", "NONE", ""),
         kv_bytes_per_block=full_bytes_per_block,
     )
     swa = RadixGroupConfig(
@@ -216,6 +218,7 @@ def two_groups(
         layer_names=("swa_layer",),
         group_id=SWA_GROUP_ID,
         kv_cache_spec_kind="sliding_window",
+        cache_format=("torch.float16", "NONE", ""),
         kv_bytes_per_block=swa_bytes_per_block,
         sliding_window=sliding_window,
         extra_retained_tokens=extra_retained_tokens,

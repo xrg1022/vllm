@@ -27,8 +27,7 @@ from vllm.v1.kv_offload.config import OffloadingConfig, OffloadingGroupConfig
 
 DEFAULT_SLOT_ALIGN = mmap.PAGESIZE
 
-# Fingerprint fields every process must agree on. Not the dtype: a worker may
-# resolve its KV dtype only in its own process; the pool bytes match.
+# Fingerprint fields every process must agree on.
 FINGERPRINT_LAYOUT_FIELDS = (
     "num_copies",
     "slot_align",
@@ -37,6 +36,7 @@ FINGERPRINT_LAYOUT_FIELDS = (
     "tokens_per_chunk",
     "kv_cache_layout",
     "model",
+    "cache_formats",
     "pools",
 )
 
@@ -60,6 +60,7 @@ class RadixGroupConfig(OffloadingGroupConfig):
     ``RadixShmemConnector``, which sees the ``KVCacheConfig``."""
 
     kv_cache_spec_kind: str
+    cache_format: tuple[str, ...]
     # Per-worker KV bytes of one block of this group's layers; 0 if unknown.
     kv_bytes_per_block: int = 0
     # Sliding-window groups: the window and the extra tokens kept (MTP).
@@ -405,6 +406,9 @@ def layout_fingerprint(
         "tokens_per_chunk": geometry.tokens_per_chunk,
         "kv_cache_layout": config.kv_cache_layout,
         "model": config.model.name,
+        "cache_formats": [
+            [g.group_id, list(g.cache_format)] for g in radix_groups(config)
+        ],
         "pools": {
             p.kind: {
                 "groups": [[m.group_id, m.offset, m.cell_bytes] for m in p.members],
