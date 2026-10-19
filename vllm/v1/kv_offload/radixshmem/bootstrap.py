@@ -51,8 +51,6 @@ def _import_radixshmem() -> Any:
         ) from e
     if not hasattr(radixshmem, "_data"):
         raise RuntimeError("`radixshmem` was built without its `_data` extension.")
-    if not hasattr(radixshmem._core.RadixClient, "generation"):
-        raise RuntimeError("`radixshmem` is too old (no `RadixClient.generation`).")
     return radixshmem
 
 

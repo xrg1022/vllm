@@ -463,7 +463,7 @@ def test_preemption_flushes_stores_and_resumes_from_the_index(name, runners):
     assert not runner.connector_scheduler._jobs
 
 
-def test_reset_cache_clears_the_pool_once_in_flight_stores_finish(name, runners):
+def test_reset_cache_rejects_transfers_then_clears_synchronously(name, runners):
     runner = runners()
     prompt = [0] * (TOKENS_PER_CHUNK * 2)
 
@@ -475,35 +475,28 @@ def test_reset_cache_clears_the_pool_once_in_flight_stores_finish(name, runners)
     with probe(name) as client:
         assert client.mempool_used() == 2
 
-    # Reset while the request runs (vLLM cannot reset the GPU cache then): the
-    # in-flight stores are flushed on the next step, then the pool is cleared.
+    assert runner.connector_scheduler.reset_cache() is False
     assert runner.scheduler.reset_prefix_cache(reset_connector=True) is False
     runner.run(
-        decoded_tokens=[0],
-        complete_transfers=False,
-        expected_flushed=(0, 1, 2, 3, 4, 5),
+        decoded_tokens=[EOS_TOKEN_ID],
         expected_stored=(0, 1, 2, 3, 4, 5),
     )
     assert not runner.connector_scheduler._jobs
     with probe(name) as client:
-        assert client.generation() == 1
+        assert hit_len(client, keys) == 2
+        assert ref_total(client) == 0
+
+    assert runner.scheduler.reset_prefix_cache(reset_connector=True)
+    with probe(name) as client:
         assert hit_len(client, keys) == 0
         assert client.mempool_used() == 0
         assert ref_total(client) == 0
 
     # The same prompt misses now and is stored again.
-    runner.run(decoded_tokens=[EOS_TOKEN_ID])
     runner.new_request(token_ids=prompt)
     runner.run(decoded_tokens=[0, EOS_TOKEN_ID], expected_stored=(0, 1, 2, 3, 4, 5))
     with probe(name) as client:
         assert hit_len(client, keys) == 2
-
-    # Nothing in flight: the pool is cleared at once.
-    assert runner.scheduler.reset_prefix_cache(reset_connector=True)
-    with probe(name) as client:
-        assert client.generation() == 2
-        assert hit_len(client, keys) == 0
-        assert client.mempool_used() == 0
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])

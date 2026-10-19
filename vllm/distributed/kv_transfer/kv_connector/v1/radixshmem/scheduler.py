@@ -584,7 +584,6 @@ class RadixShmemConnectorScheduler:
                 pending_state.lease = None
         self.manager.step()
         self._collect_events()
-        self._maybe_reset()
         for req_id in output.preempted_req_ids or ():
             state = self._req_status.get(req_id)
             if state is not None:
@@ -611,21 +610,11 @@ class RadixShmemConnectorScheduler:
         return bool(self._jobs) or self.manager.has_pending_work()
 
     def reset_cache(self) -> bool:
-        """Stop serving hits now and clear the pool once this scheduler's
-        transfers are done; they are flushed on the next step. Other ranks
-        reset through their own call."""
-        for state in self._req_status.values():
-            if state.lease is not None:
-                state.lease.release()
-                state.lease = None
-        self._current_batch_jobs_to_flush.update(self._jobs)
-        self.manager.request_reset()
-        self._maybe_reset()
-        return True
+        """Caller must first quiesce every DP rank and cross-node transfer.
 
-    def _maybe_reset(self) -> None:
-        if not self._jobs:
-            self.manager.maybe_reset()
+        Only this scheduler's outstanding work is checked here.
+        """
+        return not self._jobs and self.manager.reset()
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         meta = connector_output.kv_connector_worker_meta
@@ -663,7 +652,6 @@ class RadixShmemConnectorScheduler:
             state.transfer_jobs.remove(job_id)
             if state.finished_signaled and not state.transfer_jobs:
                 del self._req_status[job_status.req_id]
-        self._maybe_reset()
 
     def request_finished(
         self,

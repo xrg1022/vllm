@@ -45,7 +45,7 @@ class PublishResult:
 class LookupLease:
     """Pinned FULL ``slots[0:hit]``, SWA ``swa_slots`` of chunks
     ``[swa_start, hit)`` and the mamba state at ``hit`` (``mamba_slot``),
-    valid until ``release()`` or a reset of the pool."""
+    valid until ``release()``."""
 
     __slots__ = (
         "hit",
@@ -53,7 +53,6 @@ class LookupLease:
         "swa_start",
         "swa_slots",
         "mamba_slot",
-        "generation",
         "_finalize",
         "_owner",
         "_released",
@@ -67,7 +66,6 @@ class LookupLease:
         swa_slots: np.ndarray,
         finalize,
         owner: "RadixIndex",
-        generation: int,
         mamba_slot: int = -1,
     ):
         self.hit = hit
@@ -75,7 +73,6 @@ class LookupLease:
         self.swa_start = swa_start
         self.swa_slots = swa_slots
         self.mamba_slot = mamba_slot
-        self.generation = generation
         self._finalize = finalize
         self._owner = owner
         self._released = False
@@ -85,13 +82,12 @@ class LookupLease:
         return self._released
 
     def release(self) -> None:
-        """Drop the pin (idempotent); a no-op once the pool was reset."""
+        """Drop the pin (idempotent)."""
         if self._released:
             return
         self._released = True
         try:
-            if self._owner.generation() == self.generation:
-                self._finalize()
+            self._finalize()
         finally:
             self._owner._forget(self)
 
@@ -140,12 +136,8 @@ class RadixIndex:
     def encode_hashes(self, hashes: np.ndarray) -> np.ndarray:
         return hashes ^ self._hash_salt if self._hash_salt else hashes
 
-    def generation(self) -> int:
-        """The pool's reset count; see ``RadixClient.generation``."""
-        return int(self.client.generation())
-
     def reset(self) -> None:
-        """Clear the whole pool in place; earlier leases and reservations go stale."""
+        """Clear the whole pool in place after all its users are quiescent."""
         self.client.reset()
 
     @property
@@ -230,9 +222,8 @@ class RadixIndex:
             assert mamba_slot >= 0, hit
         else:
             mamba_slot = -1
-        gen = self.generation()
         lease = LookupLease(
-            hit, slots, swa_start, swa_slots, finalize, self, gen, mamba_slot
+            hit, slots, swa_start, swa_slots, finalize, self, mamba_slot
         )
         self._leases.add(lease)
         return lease
@@ -330,8 +321,6 @@ class _PendingStore:
     start: int
     end: int
     chunks: list[Chunk]
-    # Pool reset count at reservation; a reset frees the slots.
-    generation: int
     # None while the transfer runs; False when it failed.
     done: bool | None = None
 
@@ -395,7 +384,6 @@ class RadixShmemManager:
         self._inflight_stores: dict[str, _ReqStores] = {}
         self._enable_events = enable_events
         self._events: list[Publication] = []
-        self._reset_pending = False
 
     def prefix_hashes(self, hashes: Sequence[BlockHash]) -> np.ndarray:
         stride = self.tokens_per_chunk // self.tokens_per_hash
@@ -417,8 +405,6 @@ class RadixShmemManager:
         hashes: Sequence[BlockHash],
         max_tokens: int,
     ) -> LookupLease | None:
-        if self._reset_pending:
-            return None
         prefix = self.prefix_hashes(hashes)[: max_tokens // self.tokens_per_chunk]
         lease = self._remote_ready.pop(req_id, None)
         if lease is not None and lease.hit > len(prefix):
@@ -476,10 +462,7 @@ class RadixShmemManager:
         hashes: Sequence[BlockHash],
         chunks: Sequence[Chunk],
     ) -> StoreReservation | None:
-        if self._reset_pending:
-            return None
         prefix = self.prefix_hashes(hashes)
-        generation = self.index.generation()
         stores = self._inflight_stores.setdefault(req_id, _ReqStores())
         by_lane: dict[str, dict[int, dict[tuple[int, int], Chunk]]] = {}
         for chunk in chunks:
@@ -519,7 +502,7 @@ class RadixShmemManager:
                     by_index[i][member] for member in members for i in range(start, end)
                 ]
                 entry = _PendingStore(
-                    lane, prefix[:end].copy(), slots, start, end, selected, generation
+                    lane, prefix[:end].copy(), slots, start, end, selected
                 )
                 entries.append(entry)
                 for chunk in selected:
@@ -567,8 +550,6 @@ class RadixShmemManager:
             del self._inflight_stores[req_id]
 
     def _publish(self, entry: _PendingStore, req_id: str) -> PublishResult | None:
-        if self.index.generation() != entry.generation:
-            return None  # a reset since the reservation freed the slots
         if not entry.done:
             # The transfer failed: the slots hold no usable data.
             self.index.recycle(entry.slots, entry.lane)
@@ -594,29 +575,14 @@ class RadixShmemManager:
         self._remote_checked.discard(req_id)
         self._remote_sources.pop(req_id, None)
 
-    def request_reset(self) -> None:
-        """Serve no hit and reserve nothing until ``maybe_reset`` clears the pool."""
-        self._reset_pending = True
-        if self._remote is not None:
-            self._remote.clear()
-        self._remote_checked.clear()
-        self._remote_sources.clear()
-        for lease in self._remote_ready.values():
-            lease.release()
-        self._remote_ready.clear()
-
-    def maybe_reset(self) -> bool:
-        """Clear the pool once nothing of this scheduler is in flight."""
-        if (
-            not self._reset_pending
-            or self._inflight_stores
-            or self.index.has_leases
-            or self.has_pending_work()
-        ):
+    def reset(self) -> bool:
+        """Reset an externally quiesced pool; reject outstanding local work."""
+        if self._inflight_stores or self.index.has_leases or self.has_pending_work():
             return False
         self.index.reset()
-        self._reset_pending = False
-        logger.info("RadixShmem: pool reset (generation %d)", self.index.generation())
+        self._remote_checked.clear()
+        self._remote_sources.clear()
+        logger.info("RadixShmem: pool reset")
         return True
 
     def step(self) -> None:

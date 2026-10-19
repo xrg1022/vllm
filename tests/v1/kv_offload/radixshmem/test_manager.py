@@ -174,41 +174,26 @@ def test_capped_prefix_pins_its_own_swa_window(manager2, client2):
     assert ref_total(client2) == 0
 
 
-def test_reset_waits_for_in_flight_stores_and_survives_a_peer_reset(manager, client):
+def test_reset_rejects_reservations_and_leases_without_deferring(manager, client):
     keys, other = to_keys(4), to_keys(2, salt=1)
     hashes, other_hashes = block_hashes(keys), block_hashes(other)
     chunks = [Chunk(0, i) for i in range(4)]
     tokens = 4 * manager.tokens_per_chunk
 
-    # Reset while a store is in flight: no hits or new stores; cleared after it.
     out = manager.reserve("r", hashes, chunks)
     assert out is not None
     peer_publish(client, other)
-    manager.request_reset()
-    assert not manager.maybe_reset()
-    assert manager.lookup_and_pin("q", other_hashes, tokens) is None
-    assert manager.reserve("q", other_hashes, chunks[:2]) is None
+    assert not manager.reset()
     manager.complete_store(out)
     assert hit_len(client, keys) == 4
-    assert manager.maybe_reset()
-    assert client.generation() == 1
-    assert (hit_len(client, keys), hit_len(client, other)) == (0, 0)
-    assert client.mempool_used() == 0
-
-    # Another rank resets under an open reservation and pin: the reservation
-    # is neither published nor recycled, the pin is not released on new nodes.
-    out = manager.reserve("r", hashes, chunks)
-    assert out is not None
-    peer_publish(client, other)
     lease = manager.lookup_and_pin("q", other_hashes, tokens)
     assert lease is not None and ref_total(client) > 0
-    client.reset()
-    peer_publish(client, other)
-    manager.complete_store(out)
-    assert hit_len(client, keys) == 0
+    assert not manager.reset()
     lease.release()
-    assert (client.mempool_used(), ref_total(client)) == (2, 0)
     manager.finish_request("q")
+    assert manager.reset()
+    assert (hit_len(client, keys), hit_len(client, other)) == (0, 0)
+    assert (client.mempool_used(), ref_total(client)) == (0, 0)
 
     # The pool is usable afterwards.
     out = manager.reserve("r", hashes, chunks)
@@ -291,6 +276,7 @@ def test_library_pull_materializes_remote_bytes_before_loading(
                 is None
             )
             assert manager.pending("library-pull")
+            assert not manager.reset()
             _drain_remote(manager)
             lease = manager.lookup_and_pin(
                 "library-pull", hashes, 3 * manager.tokens_per_chunk
