@@ -257,7 +257,7 @@ def test_eagle_flag_on_a_sliding_window_group_is_ignored(name, runners):
         assert ref_total(client) == 0
 
 
-def test_failed_transfers_publish_nothing_and_release_the_request(
+def test_rejected_transfers_publish_nothing_and_release_the_request(
     name, runners, monkeypatch
 ):
     runner = runners()
@@ -268,7 +268,7 @@ def test_failed_transfers_publish_nothing_and_release_the_request(
     def submit(kind):
         def _submit(*args, **kwargs):
             if failing[kind]:
-                raise RuntimeError("transfer error")
+                return False
             return real_submit[kind](*args, **kwargs)
 
         return _submit
@@ -309,6 +309,32 @@ def test_failed_transfers_publish_nothing_and_release_the_request(
         assert client.mempool_used() == 2
         assert ref_total(client) == 0
     assert not runner.connector_scheduler._jobs
+
+
+@pytest.mark.parametrize("kind", ["store", "load"])
+def test_submit_exception_does_not_report_inflight_transfer_complete(
+    runners, monkeypatch, kind
+):
+    runner = runners()
+    prompt = [0] * (TOKENS_PER_CHUNK * 2)
+    if kind == "load":
+        runner.new_request(token_ids=prompt)
+        runner.run(decoded_tokens=[0, EOS_TOKEN_ID], expected_stored=(0, 1, 2, 3, 4, 5))
+        runner.scheduler.reset_prefix_cache()
+    worker = runner.worker_connector.connector_worker.worker
+    submit = getattr(worker, f"submit_{kind}")
+
+    def submit_then_raise(*args, **kwargs):
+        submit(*args, **kwargs)
+        raise RuntimeError("error after transfer submission")
+
+    monkeypatch.setattr(worker, f"submit_{kind}", submit_then_raise)
+    runner.new_request(token_ids=prompt)
+    with pytest.raises(RuntimeError, match="error after transfer submission"):
+        runner.run(decoded_tokens=[EOS_TOKEN_ID], complete_transfers=False)
+    assert worker.waiting_jobs
+    assert runner.worker_connector.build_connector_worker_meta() is None
+    assert runner.connector_scheduler._jobs
 
 
 def test_shared_slot_waits_for_both_tp_workers(name, runners):

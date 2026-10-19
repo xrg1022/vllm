@@ -118,20 +118,12 @@ class RadixShmemConnectorWorker:
         self, job_id: int, src: LoadStoreSpec, dst: LoadStoreSpec, *, load: bool
     ) -> None:
         assert self.worker is not None
-        try:
-            if load:
-                assert isinstance(dst, GPULoadStoreSpec)
-                ok = self.worker.submit_load(job_id, src, dst)
-            else:
-                assert isinstance(src, GPULoadStoreSpec)
-                ok = self.worker.submit_store(job_id, src, dst)
-        except Exception:
-            logger.exception(
-                "RadixShmem: %s job %d failed to start",
-                "load" if load else "store",
-                job_id,
-            )
-            ok = False
+        if load:
+            assert isinstance(dst, GPULoadStoreSpec)
+            ok = self.worker.submit_load(job_id, src, dst)
+        else:
+            assert isinstance(src, GPULoadStoreSpec)
+            ok = self.worker.submit_store(job_id, src, dst)
         if not ok:
             self._complete(job_id, success=False)
 
