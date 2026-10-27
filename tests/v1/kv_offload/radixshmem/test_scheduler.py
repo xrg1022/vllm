@@ -617,6 +617,7 @@ def test_swa_blocks_smaller_than_the_full_chunk(name, runners, num_tokens):
     # An unaligned prompt stores the same: its tail has no FULL chunk.
     runner = runners(swa_groups=1, full_block=16)
     spec = scheduler_spec(runner)
+    assert spec.geometry.swa is not None
     assert spec.geometry.swa.window_blocks == 1
     assert spec.geometry.swa.members[0].sub_blocks == 2
     runner.new_request(token_ids=[0] * num_tokens)
@@ -800,6 +801,8 @@ def test_mamba_states_store_and_serve_capped_hits(sched):
     assert list(gpu.block_indices[1:]) == [bpc - 1] * n
     _complete_all(scheduler)
     with probe(name) as client:
+        # One float32 state per group and GPU block; only the store stride is padded.
+        assert client.component_config.mamba_state_bytes == 4 * n * bpc
         assert ref_total(client) == 0
         # One mamba slot per stored chunk end, whatever the number of groups.
         assert client.health_report().mamba.used == 2

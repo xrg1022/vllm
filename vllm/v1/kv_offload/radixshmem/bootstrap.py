@@ -283,33 +283,16 @@ def _check_published_geometry(info: Any, geometry: SlotGeometry) -> dict[str, in
     return pool_slots
 
 
-def _check_store(
-    rs: Any, store: Any, geometry: SlotGeometry, pool_slots: Mapping[str, int]
-) -> None:
-    data_bytes = len(store.data_view())
+def _check_store(rs: Any, store: Any, geometry: SlotGeometry) -> None:
     for pool in geometry.pools:
-        component = component_of(rs, pool.kind)
-        if not store.has_pool(component):
-            raise RuntimeError(f"RadixShmem: SlotStore has no {pool.kind} pool")
-        sp = store.pool(component)
+        sp = store.pool(component_of(rs, pool.kind))
         # The package checks slot_bytes >=; the strided views need ==.
         compare_fingerprint(
-            {"num_slots": pool_slots[pool.kind], "slot_bytes": pool.slot_stride},
-            {"num_slots": int(sp.num_slots), "slot_bytes": int(sp.slot_bytes)},
-            ("num_slots", "slot_bytes"),
+            {"slot_bytes": pool.slot_stride},
+            {"slot_bytes": int(sp.slot_bytes)},
+            ("slot_bytes",),
             what=f"SlotStore's {pool.kind} pool",
         )
-        if pool.kind == "full" and int(sp.base) != 0:
-            raise RuntimeError(
-                "RadixShmem: the FULL pool is not at offset 0 of the data region "
-                f"(offset {sp.base})"
-            )
-        end = int(sp.base) + int(sp.num_slots) * int(sp.slot_bytes)
-        if end > data_bytes:
-            raise RuntimeError(
-                f"RadixShmem: the {pool.kind} pool ends at {end} B, past the "
-                f"{data_bytes} B data region"
-            )
 
 
 def describe_pools(geometry: SlotGeometry, pool_slots: Mapping[str, int]) -> str:
@@ -450,7 +433,7 @@ class RadixRegions:
                     what=_OWNER_DESCRIPTION,
                 )
             regions.store = regions.client.store
-            _check_store(rs, regions.store, geometry, pool_slots)
+            _check_store(rs, regions.store, geometry)
         except BaseException:
             regions.close()
             raise

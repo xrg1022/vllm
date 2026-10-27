@@ -256,20 +256,6 @@ def server_geometry(rs: Any, geometry: SlotGeometry) -> Any:
     return rs.Geometry(**kwargs)
 
 
-def plan_slots(geometry: SlotGeometry) -> dict[str, int]:
-    """The server's slot plan, without creating shared resources."""
-    import radixshmem
-    from radixshmem._geometry import plan
-
-    cfg = radixshmem.ServerConfig(
-        data_bytes=geometry.cpu_bytes_to_use,
-        slot_align=geometry.slot_align,
-        **{f"{p.kind}_ratio": p.ratio for p in geometry.pools[1:]},
-    )
-    planned = plan(server_geometry(radixshmem, geometry).to_dict(), cfg)
-    return {kind: int(pool["num_slots"]) for kind, pool in planned["pools"].items()}
-
-
 def _apply_ratios(
     pools: list[PoolGeometry], extra: Mapping[str, Any]
 ) -> list[PoolGeometry]:
@@ -357,11 +343,8 @@ def compute_geometry(
                 f"window, got {sorted(windows)} full chunks. " + HYBRID_HINT
             )
         slot_bytes = offset * num_copies
-        first = groups[lanes[kind][0]]
         if kind == "mamba":
-            _check_mamba(first, full_group)
-            # The library checks the mamba state size against the store stride.
-            slot_bytes = round_up(slot_bytes, slot_align)
+            _check_mamba(groups[lanes[kind][0]], full_group)
         pools.append(
             PoolGeometry(
                 kind=kind,
@@ -376,7 +359,7 @@ def compute_geometry(
     if not extra.get("cpu_bytes_to_use"):
         raise ValueError("cpu_bytes_to_use must be set in kv_connector_extra_config")
     cpu_bytes_to_use = int(extra["cpu_bytes_to_use"])
-    geometry = SlotGeometry(
+    return SlotGeometry(
         num_copies=num_copies,
         slot_align=slot_align,
         tokens_per_block=tokens_per_block,
@@ -385,13 +368,6 @@ def compute_geometry(
         cpu_bytes_to_use=cpu_bytes_to_use,
         pools=tuple(_apply_ratios(pools, extra)),
     )
-    try:
-        plan_slots(geometry)
-    except ValueError as exc:
-        raise ValueError(
-            f"RadixShmem: cannot plan cpu_bytes_to_use={cpu_bytes_to_use}: {exc}"
-        ) from exc
-    return geometry
 
 
 def layout_fingerprint(

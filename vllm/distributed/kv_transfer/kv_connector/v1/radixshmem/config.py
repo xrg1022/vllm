@@ -7,6 +7,7 @@ from dataclasses import fields, replace
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    _group_kv_bytes_per_block,
     build_offloading_config,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
@@ -19,7 +20,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
     SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
     iter_layer_specs,
 )
@@ -39,13 +39,6 @@ def _sliding_window(group: KVCacheGroupSpec) -> tuple[int | None, int]:
     ):
         return first.sliding_window, first.extra_retained_tokens
     return None, 0
-
-
-def _kv_bytes_per_block(group: KVCacheGroupSpec) -> int:
-    spec = group.kv_cache_spec
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        return spec.page_size_bytes
-    return spec.page_size_bytes * len(group.layer_names)
 
 
 def _cache_format(group: KVCacheGroupSpec) -> tuple[str, ...]:
@@ -103,7 +96,7 @@ def build_radix_offloading_config(
                 **{f.name: getattr(g, f.name) for f in fields(g)},
                 kv_cache_spec_kind=get_kv_cache_spec_kind(kv_group.kv_cache_spec).value,
                 cache_format=_cache_format(kv_group),
-                kv_bytes_per_block=_kv_bytes_per_block(kv_group),
+                kv_bytes_per_block=_group_kv_bytes_per_block(kv_group),
                 sliding_window=sliding_window,
                 extra_retained_tokens=extra_retained,
             )

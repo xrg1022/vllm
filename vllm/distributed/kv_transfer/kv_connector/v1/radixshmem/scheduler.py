@@ -190,7 +190,6 @@ class RadixShmemConnectorScheduler:
         )
         self._req_status: dict[ReqId, RadixRequestState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
-        self._current_batch_jobs_to_flush: set[int] = set()
         self._gpu_block_pool: BlockPool | None = None
         self._pending_store_jobs: dict[int, TransferJob] = {}
 
@@ -584,16 +583,15 @@ class RadixShmemConnectorScheduler:
                 pending_state.lease = None
         self.manager.step()
         self._collect_events()
+        jobs_to_flush: set[int] = set()
         for req_id in output.preempted_req_ids or ():
             state = self._req_status.get(req_id)
             if state is not None:
-                self._current_batch_jobs_to_flush.update(state.transfer_jobs)
+                jobs_to_flush.update(state.transfer_jobs)
         stores, self._pending_store_jobs = self._pending_store_jobs, {}
         stores.update(self._build_boundary_store_jobs(output))
         stores.update(self._build_store_jobs(output))
-        meta = RadixShmemMetadata(
-            self._current_batch_load_jobs, stores, self._current_batch_jobs_to_flush
-        )
+        meta = RadixShmemMetadata(self._current_batch_load_jobs, stores, jobs_to_flush)
         for req_id in output.finished_req_ids or ():
             state = self._req_status.get(req_id)
             if state is None:
@@ -603,7 +601,6 @@ class RadixShmemConnectorScheduler:
             if not state.transfer_jobs:
                 del self._req_status[req_id]
         self._current_batch_load_jobs = {}
-        self._current_batch_jobs_to_flush = set()
         return meta
 
     def has_pending_push_work(self) -> bool:

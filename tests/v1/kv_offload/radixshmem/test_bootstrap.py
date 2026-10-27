@@ -26,10 +26,12 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.radixshmem.backend import RadixShmemBackend
 from vllm.v1.kv_offload.radixshmem.bootstrap import RadixRegions
+from vllm.v1.kv_offload.radixshmem.geometry import radix_groups
 from vllm.v1.kv_offload.radixshmem.manager import Chunk
 
 from .utils import (
@@ -81,7 +83,8 @@ def test_remote_replica_bootstraps_its_pool_and_separates_cache_domains(
         first.finish_request("writer")
     groups = (
         replace(
-            make_config(extra).groups[0], cache_format=("torch.bfloat16", "NONE", "")
+            radix_groups(make_config(extra))[0],
+            cache_format=("torch.bfloat16", "NONE", ""),
         ),
     )
     with open_pool(extra, groups=groups), open_manager(extra, groups=groups) as other:
@@ -135,7 +138,9 @@ def test_attach_checks_resolved_cache_format(name):
     config.cache_config.kv_cache_layout = None
     config.model_config.dtype = torch.float16
     worker_config = _make_kv_cache_config()
-    spec = replace(worker_config.kv_cache_groups[0].kv_cache_spec, dtype=torch.float16)
+    spec = worker_config.kv_cache_groups[0].kv_cache_spec
+    assert isinstance(spec, AttentionSpec)
+    spec = replace(spec, dtype=torch.float16)
     worker_config.kv_cache_groups[0].kv_cache_spec = UniformTypeKVCacheSpecs(
         spec.block_size, {"layer": spec}
     )
@@ -202,6 +207,22 @@ def test_owner_worker_creates_the_pool_and_a_scheduler_attaches(name):
             assert client.mempool_total() == DEFAULT_NUM_SLOTS
 
     # Close order: client, server (store + index gone), sentinel; no leftovers.
+    assert shm_leftovers(name) == []
+
+
+def test_server_rejects_a_budget_smaller_than_one_slot(name):
+    spec = RadixShmemBackend(
+        make_config(make_extra(name, cpu_bytes_to_use=SLOT_ALIGN - 1))
+    )
+    with (
+        pytest.raises(ValueError, match="leaving no FULL slot"),
+        closing(
+            RadixRegions.open_worker(
+                spec.geometry, spec.settings, spec.fingerprint(), owner=True
+            )
+        ),
+    ):
+        pytest.fail("server accepted an insufficient pool budget")
     assert shm_leftovers(name) == []
 
 
